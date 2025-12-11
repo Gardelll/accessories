@@ -657,6 +657,10 @@ public class AccessoriesEventHandler {
 
         var keepInv = gamerules.getRule(GameRules.RULE_KEEPINVENTORY).get() || gamerules.getRule(Accessories.RULE_KEEP_ACCESSORY_INVENTORY).get();
 
+        var result = OnDeathCallback.EVENT.invoker().shouldDrop(TriState.DEFAULT, entity, capability, source, droppedStacks);
+
+        if (!result.orElse(true)) return null;
+
         for (var containerEntry : ((AccessoriesHolderImpl) capability.getHolder()).getAllSlotContainers().entrySet()) {
             var slotType = containerEntry.getValue().slotType();
 
@@ -677,10 +681,6 @@ public class AccessoriesEventHandler {
                 if (cosmeticStack != null) droppedStacks.add(cosmeticStack);
             }
         }
-
-        var result = OnDeathCallback.EVENT.invoker().shouldDrop(TriState.DEFAULT, entity, capability, source, droppedStacks);
-
-        if (!result.orElse(true)) return null;
 
         return droppedStacks;
     }
