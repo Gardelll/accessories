@@ -645,21 +645,46 @@ public class AccessoriesEventHandler {
         AccessoriesInternals.addAttributeTooltips((entity instanceof Player player ? player : null), stack, multimap, tooltip::add, context, flag);
     }
 
+    private record DropAction(ItemStack stack, boolean shouldDrop, boolean destroyStack, boolean keepingStack,
+                              ExpandedSimpleContainer container, int slot,
+                              @Nullable List<NestMutation> nestMutations) {
+
+        record NestMutation(int innerIndex, AccessoryNest holdable) {}
+
+        void apply() {
+            if (nestMutations != null) {
+                for (var mutation : nestMutations) {
+                    mutation.holdable.setInnerStack(stack, mutation.innerIndex, ItemStack.EMPTY);
+                    // TODO: Do we call break here for the accessory?
+                }
+
+                if (!nestMutations.isEmpty()) {
+                    container.setItem(slot, stack);
+                }
+            }
+
+            if (keepingStack) {
+                // Used to indicate within the Accessories system when the player becomes alive that we need to
+                // equip the accessory again to trigger equip call and properly add back Attributes
+                container.setPreviousItem(slot, ItemStack.EMPTY);
+            } else if (destroyStack || shouldDrop) {
+                container.setItem(slot, ItemStack.EMPTY);
+            }
+        }
+    }
+
     @Nullable
     public static Collection<ItemStack> onDeath(LivingEntity entity, DamageSource source) {
         var capability = AccessoriesCapability.get(entity);
 
         if (capability == null) return List.of();
 
-        var droppedStacks = new ArrayList<ItemStack>();
-
         var gamerules = entity.level().getGameRules();
 
         var keepInv = gamerules.getRule(GameRules.RULE_KEEPINVENTORY).get() || gamerules.getRule(Accessories.RULE_KEEP_ACCESSORY_INVENTORY).get();
 
-        var result = OnDeathCallback.EVENT.invoker().shouldDrop(TriState.DEFAULT, entity, capability, source, droppedStacks);
-
-        if (!result.orElse(true)) return null;
+        // Phase 1: Resolve drop actions without modifying containers
+        var pendingActions = new ArrayList<DropAction>();
 
         for (var containerEntry : ((AccessoriesHolderImpl) capability.getHolder()).getAllSlotContainers().entrySet()) {
             var slotType = containerEntry.getValue().slotType();
@@ -674,28 +699,44 @@ public class AccessoriesEventHandler {
             for (int i = 0; i < container.getSize(); i++) {
                 var reference = SlotReference.of(entity, container.getSlotName(), i);
 
-                var stack = dropStack(slotDropRule, entity, stacks, reference, source, keepInv);
-                if (stack != null) droppedStacks.add(stack);
-
-                var cosmeticStack = dropStack(slotDropRule, entity, cosmeticStacks, reference, source, keepInv);
-                if (cosmeticStack != null) droppedStacks.add(cosmeticStack);
+                resolveDropAction(slotDropRule, entity, stacks, reference, source, keepInv, pendingActions);
+                resolveDropAction(slotDropRule, entity, cosmeticStacks, reference, source, keepInv, pendingActions);
             }
+        }
+
+        var droppedStacks = new ArrayList<ItemStack>();
+
+        for (var action : pendingActions) {
+            if (action.shouldDrop) droppedStacks.add(action.stack);
+        }
+
+        // Phase 2: Let listeners inspect the computed drop list and decide whether to proceed
+        var result = OnDeathCallback.EVENT.invoker().shouldDrop(TriState.DEFAULT, entity, capability, source, droppedStacks);
+
+        if (!result.orElse(true)) return null;
+
+        // Phase 3: Apply container mutations only after callback approval
+        for (var action : pendingActions) {
+            action.apply();
         }
 
         return droppedStacks;
     }
 
-    @Nullable
-    private static ItemStack dropStack(DropRule dropRule, LivingEntity entity, ExpandedSimpleContainer container, SlotReference reference, DamageSource source, boolean keepInvEnabled) {
+    private static void resolveDropAction(DropRule dropRule, LivingEntity entity, ExpandedSimpleContainer container,
+                                          SlotReference reference, DamageSource source, boolean keepInvEnabled,
+                                          List<DropAction> actions) {
         var stack = container.getItem(reference.slot());
 
-        if (stack.isEmpty()) return null;
+        if (stack.isEmpty()) return;
 
         var accessory = AccessoriesAPI.getOrDefaultAccessory(stack);
 
         if (accessory != null && dropRule == DropRule.DEFAULT) {
             dropRule = accessory.getDropRule(stack, reference, source);
         }
+
+        List<DropAction.NestMutation> nestMutations = null;
 
         if (accessory instanceof AccessoryNest holdable) {
             var dropRuleToStacks = holdable.getDropRules(stack, reference, source);
@@ -705,55 +746,43 @@ public class AccessoriesEventHandler {
 
                 var innerStack = rulePair.right();
 
-                var result = OnDropCallback.getAlternativeRule(rulePair.left(), innerStack, reference, source);
+                var callbackResult = OnDropCallback.getAlternativeRule(rulePair.left(), innerStack, reference, source);
 
-                var breakInnerStack = (result == DropRule.DEFAULT && EnchantmentHelper.has(innerStack, EnchantmentEffectComponents.PREVENT_EQUIPMENT_DROP))
-                        || (result == DropRule.DESTROY);
+                var breakInnerStack = (callbackResult == DropRule.DEFAULT && EnchantmentHelper.has(innerStack, EnchantmentEffectComponents.PREVENT_EQUIPMENT_DROP))
+                        || (callbackResult == DropRule.DESTROY);
 
                 if (breakInnerStack) {
-                    holdable.setInnerStack(stack, i, ItemStack.EMPTY);
-                    // TODO: Do we call break here for the accessory?
-
-                    container.setItem(reference.slot(), stack);
+                    if (nestMutations == null) nestMutations = new ArrayList<>();
+                    nestMutations.add(new DropAction.NestMutation(i, holdable));
                 }
             }
         }
 
-        var result = OnDropCallback.getAlternativeRule(dropRule, stack, reference, source);
+        var dropResult = OnDropCallback.getAlternativeRule(dropRule, stack, reference, source);
 
-        boolean dropStack = true;
+        boolean shouldDrop = true;
         boolean keepingStack = false;
+        boolean destroyStack = false;
 
-        if (result == DropRule.DESTROY) {
-            container.setItem(reference.slot(), ItemStack.EMPTY);
-            dropStack = false;
+        if (dropResult == DropRule.DESTROY) {
+            shouldDrop = false;
+            destroyStack = true;
             // TODO: Do we call break here for the accessory?
-        } else if (result == DropRule.KEEP) {
-            dropStack = false;
+        } else if (dropResult == DropRule.KEEP) {
+            shouldDrop = false;
             keepingStack = true;
-        } else if (result == DropRule.DEFAULT) {
+        } else if (dropResult == DropRule.DEFAULT) {
             if (keepInvEnabled) {
-                dropStack = false;
-
+                shouldDrop = false;
                 keepingStack = true;
             } else if (EnchantmentHelper.has(stack, EnchantmentEffectComponents.PREVENT_EQUIPMENT_DROP)) {
-                container.setItem(reference.slot(), ItemStack.EMPTY);
-                dropStack = false;
+                shouldDrop = false;
+                destroyStack = true;
                 // TODO: Do we call break here for the accessory?
             }
         }
 
-        // Used to indicate within the Accessories system when the player becomes alive that we need to
-        // equip the accessory again to trigger equip call and properly add back Attributes
-        if (keepingStack) {
-            container.setPreviousItem(reference.slot(), ItemStack.EMPTY);
-        }
-
-        if (!dropStack) return null;
-
-        container.setItem(reference.slot(), ItemStack.EMPTY);
-
-        return stack;
+        actions.add(new DropAction(stack, shouldDrop, destroyStack, keepingStack, container, reference.slot(), nestMutations));
     }
 
     public static InteractionResultHolder<ItemStack> attemptEquipFromUse(Player player, InteractionHand hand) {
